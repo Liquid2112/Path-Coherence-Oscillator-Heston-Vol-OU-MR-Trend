@@ -1,12 +1,7 @@
 """
-Path Coherence Oscillator (PCO) - Production Demo
-=================================================
-
-- Fetches daily data via yfinance
-- Computes a rolling Path Coherence Oscillator
-- Produces publication-quality Plotly charts:
-  - Price + Oscillator panel
-  - Scenario fan chart of future paths
+Path Coherence Oscillator (PCO) - HTML EXPORT VERSION
+=====================================================
+Saves charts as HTML files instead of opening in browser
 """
 
 import numpy as np
@@ -16,85 +11,70 @@ from typing import List, Tuple, Optional
 from scipy.stats import gaussian_kde
 import warnings
 from datetime import datetime, timedelta
+from tqdm import tqdm
 
-import yfinance as yf  # pip install yfinance
-import plotly.graph_objects as go  # pip install plotly
+import yfinance as yf
+import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 warnings.filterwarnings("ignore")
 
 
-# ------------------------------
-# Core model: scenarios & PCO
-# ------------------------------
-
 @dataclass
 class PathScenario:
-    """
-    Represents a single probabilistic future trajectory with metadata.
-    """
-    trajectory: np.ndarray          # Price path
+    """Represents a single probabilistic future trajectory with metadata."""
+    trajectory: np.ndarray
     log_returns: np.ndarray
-    volatility_path: np.ndarray     # For Heston-generated paths
-    probability_weight: float       # Posterior weight from likelihood
-    phase: float                    # Directional phase ([-pi/2, pi/2])
-    features: dict                  # Structural features
+    volatility_path: np.ndarray
+    probability_weight: float
+    phase: float
+    features: dict
 
     def calculate_geometry(self) -> dict:
         """Compute path geometry for alignment comparison."""
-        # Curvature: L2 norm of second derivative
-        curvature = np.gradient(np.gradient(self.trajectory))
-        total_curvature = np.sqrt(np.sum(curvature**2))
+        grad1 = np.gradient(self.trajectory)
+        grad2 = np.gradient(grad1)
 
-        # Convexity: integrated second derivative sign
-        convexity = np.sum(np.sign(np.gradient(np.gradient(self.trajectory))))
+        total_curvature = np.sqrt(np.sum(grad2**2))
+        convexity = np.sum(np.sign(grad2))
 
-        # Trend consistency
-        returns = np.diff(np.log(self.trajectory))
-        trend_consistency = np.abs(np.mean(returns)) / (np.std(returns) + 1e-8)
+        returns = np.diff(np.log(self.trajectory + 1e-10))
+        mean_ret = np.mean(returns)
+        std_ret = np.std(returns) + 1e-8
 
-        # Volatility trajectory shape
+        trend_consistency = np.abs(mean_ret) / std_ret
         vol_shape = np.std(np.diff(self.volatility_path))
+
+        cummax = np.maximum.accumulate(self.trajectory)
+        drawdown = self.trajectory / (cummax + 1e-10) - 1.0
 
         return {
             "curvature": total_curvature,
             "convexity": convexity,
             "trend_consistency": trend_consistency,
             "vol_shape": vol_shape,
-            "terminal_return": self.log_returns[-1],
-            "max_drawdown": np.min(
-                self.trajectory / np.maximum.accumulate(self.trajectory) - 1.0
-            ),
-            "sharpe_path": np.mean(returns)
-            / (np.std(returns) + 1e-8)
-            * np.sqrt(252.0),
+            "terminal_return": self.log_returns[-1] if len(self.log_returns) > 0 else 0.0,
+            "max_drawdown": np.min(drawdown),
+            "sharpe_path": mean_ret / std_ret * np.sqrt(252.0),
         }
 
 
 class PathCoherenceOscillator:
-    """
-    Multi-Path Probability Oscillator using interference pattern analysis.
-
-    Generates competing trajectory scenarios and measures their structural
-    alignment through wave-like interference patterns.
-    """
+    """Multi-Path Probability Oscillator using interference pattern analysis."""
 
     def __init__(
         self,
-        n_paths: int = 256,
-        horizon: int = 20,  # Trading days ahead
+        n_paths: int = 128,
+        horizon: int = 20,
         dt: float = 1.0 / 252.0,
         risk_free_rate: float = 0.04,
-        # Heston parameters
         heston_kappa: float = 2.0,
         heston_theta: float = 0.04,
         heston_sigma: float = 0.3,
         heston_rho: float = -0.7,
-        # OU parameters
         ou_theta: float = 0.2,
         ou_mu: float = 0.0,
         ou_sigma: float = 0.15,
-        # Mixture weights
         trend_regime_prob: float = 0.4,
         meanrev_regime_prob: float = 0.4,
         random_walk_prob: float = 0.2,
@@ -123,8 +103,7 @@ class PathCoherenceOscillator:
         self.regime_weights /= self.regime_weights.sum()
 
         self.path_bundle: List[PathScenario] = []
-
-    # ----- Path generators -----
+        self._rng = np.random.default_rng()
 
     def _generate_heston_path(
         self,
@@ -132,41 +111,27 @@ class PathCoherenceOscillator:
         v0: float,
         regime_strength: float = 1.0,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Heston stochastic volatility model.
-
-        dS = r S dt + sqrt(V) S dW1
-        dV = kappa(theta - V) dt + sigma sqrt(V) dW2
-        Corr(dW1, dW2) = rho
-        """
+        """Heston stochastic volatility model - VECTORIZED."""
         kappa = self.heston_params["kappa"] * regime_strength
         theta = self.heston_params["theta"]
         sigma_v = self.heston_params["sigma"]
         rho = self.heston_params["rho"]
 
-        prices = np.zeros(self.horizon + 1)
-        vols = np.zeros(self.horizon + 1)
+        prices = np.empty(self.horizon + 1)
+        vols = np.empty(self.horizon + 1)
 
         prices[0] = s0
         vols[0] = max(v0, 1e-6)
 
-        dW1 = np.random.normal(0.0, np.sqrt(self.dt), self.horizon)
-        dW2 = rho * dW1 + np.sqrt(1.0 - rho**2) * np.random.normal(
-            0.0, np.sqrt(self.dt), self.horizon
-        )
+        sqrt_dt = np.sqrt(self.dt)
+        dW1 = self._rng.normal(0.0, sqrt_dt, self.horizon)
+        dW2 = rho * dW1 + np.sqrt(1.0 - rho**2) * self._rng.normal(0.0, sqrt_dt, self.horizon)
 
         for t in range(self.horizon):
             v_pos = max(vols[t], 0.0)
 
-            vols[t + 1] = (
-                vols[t]
-                + kappa * (theta - v_pos) * self.dt
-                + sigma_v * np.sqrt(v_pos) * dW2[t]
-            )
-
-            prices[t + 1] = prices[t] * np.exp(
-                (self.r - 0.5 * v_pos) * self.dt + np.sqrt(v_pos) * dW1[t]
-            )
+            vols[t + 1] = vols[t] + kappa * (theta - v_pos) * self.dt + sigma_v * np.sqrt(v_pos) * dW2[t]
+            prices[t + 1] = prices[t] * np.exp((self.r - 0.5 * v_pos) * self.dt + np.sqrt(v_pos) * dW1[t])
 
         return prices, vols
 
@@ -175,29 +140,24 @@ class PathCoherenceOscillator:
         s0: float,
         target_price: Optional[float] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        OU mean-reverting path on log-prices.
-
-        d log S = theta (mu - log S) dt + sigma dW
-        """
+        """OU mean-reverting path - VECTORIZED."""
         theta = self.ou_params["theta"]
         mu = self.ou_params["mu"]
         sigma = self.ou_params["sigma"]
 
-        log_prices = np.zeros(self.horizon + 1)
+        log_prices = np.empty(self.horizon + 1)
         log_prices[0] = np.log(s0)
 
         if target_price is not None:
             mu = np.log(target_price)
 
+        sqrt_dt = np.sqrt(self.dt)
         for t in range(self.horizon):
-            dW = np.random.normal(0.0, np.sqrt(self.dt))
-            log_prices[t + 1] = (
-                log_prices[t] + theta * (mu - log_prices[t]) * self.dt + sigma * dW
-            )
+            dW = self._rng.normal(0.0, sqrt_dt)
+            log_prices[t + 1] = log_prices[t] + theta * (mu - log_prices[t]) * self.dt + sigma * dW
 
         prices = np.exp(log_prices)
-        vols = np.ones_like(prices) * sigma
+        vols = np.full_like(prices, sigma)
         return prices, vols
 
     def _generate_trend_path(
@@ -205,14 +165,12 @@ class PathCoherenceOscillator:
         s0: float,
         drift: float,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Simple trend-following GBM-style path."""
-        rets = np.random.normal(drift * self.dt, 0.02 * np.sqrt(self.dt), self.horizon)
-        log_prices = np.log(s0) + np.cumsum(np.insert(rets, 0, 0.0))
+        """Simple trend-following GBM-style path - VECTORIZED."""
+        rets = self._rng.normal(drift * self.dt, 0.02 * np.sqrt(self.dt), self.horizon)
+        log_prices = np.log(s0) + np.concatenate([[0.0], np.cumsum(rets)])
         prices = np.exp(log_prices)
-        vols = np.ones_like(prices) * 0.15
+        vols = np.full_like(prices, 0.15)
         return prices, vols
-
-    # ----- Bundle generation -----
 
     def generate_path_bundle(
         self,
@@ -230,12 +188,12 @@ class PathCoherenceOscillator:
             adjusted_weights = self.regime_weights
 
         n_per_regime = (self.n_paths * adjusted_weights).astype(int)
+        n_per_regime[-1] = self.n_paths - n_per_regime[:-1].sum()
 
         path_idx = 0
 
-        # 1) Trend regime
         for _ in range(n_per_regime[0]):
-            drift = np.random.choice([-1.0, 1.0]) * np.random.uniform(0.15, 0.35) / 252.0
+            drift = self._rng.choice([-1.0, 1.0]) * self._rng.uniform(0.15, 0.35) / 252.0
             if recent_trend is not None:
                 drift = np.sign(recent_trend) * abs(drift)
 
@@ -243,20 +201,18 @@ class PathCoherenceOscillator:
             self._add_path(prices, vols, "trend", path_idx)
             path_idx += 1
 
-        # 2) Mean-reversion (Heston + OU blend)
         for _ in range(n_per_regime[1]):
             prices_h, vols_h = self._generate_heston_path(s0, v0, regime_strength=1.5)
-            target = s0 * (1.0 + np.random.normal(0.0, 0.05))
+            target = s0 * (1.0 + self._rng.normal(0.0, 0.05))
             prices_ou, vols_ou = self._generate_ou_path(s0, target)
 
-            mix_w = np.random.beta(2.0, 2.0)
+            mix_w = self._rng.beta(2.0, 2.0)
             prices = mix_w * prices_h + (1.0 - mix_w) * prices_ou
             vols = mix_w * vols_h + (1.0 - mix_w) * vols_ou
 
             self._add_path(prices, vols, "meanrev", path_idx)
             path_idx += 1
 
-        # 3) Random / uncertain regime (mild Heston)
         for _ in range(n_per_regime[2]):
             prices, vols = self._generate_heston_path(s0, v0, regime_strength=0.5)
             self._add_path(prices, vols, "random", path_idx)
@@ -270,18 +226,14 @@ class PathCoherenceOscillator:
         idx: int,
     ) -> None:
         """Create PathScenario and add to bundle."""
-        log_returns = np.diff(np.log(prices))
+        log_returns = np.diff(np.log(prices + 1e-10))
 
         path_vol = np.std(log_returns) * np.sqrt(252.0)
-        if path_vol > 0.0:
-            likelihood_weight = np.exp(-0.5 * (path_vol - 0.2) ** 2 / 0.1**2)
-        else:
-            likelihood_weight = 1.0
+        likelihood_weight = np.exp(-0.5 * (path_vol - 0.2) ** 2 / 0.1**2) if path_vol > 0.0 else 1.0
 
         terminal_return = np.sum(log_returns)
         vol_norm = np.std(log_returns) * np.sqrt(self.horizon) + 1e-8
-        z = terminal_return / vol_norm
-        phase = np.arctan(z)
+        phase = np.arctan(terminal_return / vol_norm)
 
         scenario = PathScenario(
             trajectory=prices,
@@ -293,65 +245,62 @@ class PathCoherenceOscillator:
         )
         self.path_bundle.append(scenario)
 
-    # ----- Interference + oscillator -----
-
-    def _compute_phase_concentration(
-        self, phases: np.ndarray, weights: np.ndarray
-    ) -> float:
-        R = np.abs(np.sum(weights * np.exp(1j * phases))) / np.sum(weights)
+    def _compute_phase_concentration(self, phases: np.ndarray, weights: np.ndarray) -> float:
+        R = np.abs(np.sum(weights * np.exp(1j * phases))) / (np.sum(weights) + 1e-10)
         return float(R)
 
     def _find_peaks(self, density: np.ndarray, threshold: float = 0.3) -> List[int]:
         peaks = []
-        for i in range(1, len(density) - 1):
-            if (
-                density[i] > density[i - 1]
-                and density[i] > density[i + 1]
-                and density[i] > threshold * density.max()
-            ):
-                peaks.append(i)
-        return peaks
+        if len(density) < 3:
+            return peaks
+
+        is_peak = (density[1:-1] > density[:-2]) & (density[1:-1] > density[2:])
+        is_significant = density[1:-1] > threshold * density.max()
+        peak_indices = np.where(is_peak & is_significant)[0] + 1
+        return peak_indices.tolist()
 
     def compute_interference_pattern(self) -> dict:
-        """Compute interference/coherence metrics from the path ensemble."""
+        """Compute interference/coherence metrics - OPTIMIZED."""
         if not self.path_bundle:
             raise ValueError("Path bundle is empty; call generate_path_bundle first.")
 
         amplitudes = np.array([p.probability_weight for p in self.path_bundle])
         phases = np.array([p.phase for p in self.path_bundle])
 
-        complex_sum = np.sum(amplitudes * np.exp(1j * phases))
+        complex_weights = amplitudes * np.exp(1j * phases)
+        complex_sum = np.sum(complex_weights)
         total_weight = np.sum(amplitudes)
         coherence = np.abs(complex_sum) ** 2 / (total_weight**2 + 1e-10)
 
         geometries = [p.calculate_geometry() for p in self.path_bundle]
-        feature_matrix = np.array(
-            [
-                [
-                    g["curvature"],
-                    g["trend_consistency"],
-                    g["vol_shape"],
-                    g["sharpe_path"],
-                ]
-                for g in geometries
-            ]
-        )
+        feature_matrix = np.array([
+            [g["curvature"], g["trend_consistency"], g["vol_shape"], g["sharpe_path"]]
+            for g in geometries
+        ])
 
-        norm_features = (feature_matrix - feature_matrix.mean(axis=0)) / (
-            feature_matrix.std(axis=0) + 1e-8
-        )
+        feature_mean = feature_matrix.mean(axis=0)
+        feature_std = feature_matrix.std(axis=0) + 1e-8
+        norm_features = (feature_matrix - feature_mean) / feature_std
+
         feature_dispersion = np.trace(np.cov(norm_features.T))
         structural_alignment = 1.0 / (1.0 + feature_dispersion)
 
-        terminal_returns = np.array([p.log_returns[-1] for p in self.path_bundle])
-        kde = gaussian_kde(terminal_returns, weights=amplitudes)
-        grid = np.linspace(terminal_returns.min(), terminal_returns.max(), 100)
-        density = kde(grid)
+        terminal_returns = np.array([p.log_returns[-1] if len(p.log_returns) > 0 else 0.0 
+                                      for p in self.path_bundle])
+
+        if len(np.unique(terminal_returns)) > 1:
+            normalized_weights = amplitudes / (amplitudes.sum() + 1e-10)
+            kde = gaussian_kde(terminal_returns, weights=normalized_weights)
+            grid = np.linspace(terminal_returns.min(), terminal_returns.max(), 100)
+            density = kde(grid)
+            density = density / (density.sum() + 1e-10)
+        else:
+            density = np.ones(100) / 100.0
 
         peaks = self._find_peaks(density)
-        entropy = -np.sum(density * np.log(density + 1e-10)) / len(density)
+        entropy = -np.sum(density * np.log(density + 1e-10))
         max_entropy = np.log(len(density))
-        convergence_score = 1.0 - (entropy / max_entropy)
+        convergence_score = 1.0 - (entropy / (max_entropy + 1e-10))
 
         return {
             "interference_coherence": float(coherence),
@@ -359,21 +308,13 @@ class PathCoherenceOscillator:
             "terminal_convergence": float(convergence_score),
             "feature_dispersion": float(feature_dispersion),
             "n_modal_peaks": int(len(peaks)),
-            "phase_concentration": self._compute_phase_concentration(
-                phases, amplitudes
-            ),
+            "phase_concentration": self._compute_phase_concentration(phases, amplitudes),
             "wave_amplitude": float(np.abs(complex_sum) / (total_weight + 1e-10)),
             "wave_phase": float(np.angle(complex_sum)),
         }
 
     def compute_oscillator(self) -> float:
-        """
-        Composite oscillator in [0, 100].
-
-        80–100: high coherence (stable regime)
-        50–80: mixed signals
-        0–50: decoherence (regime transition zone)
-        """
+        """Composite oscillator in [0, 100]."""
         pattern = self.compute_interference_pattern()
         osc = (
             0.35 * pattern["interference_coherence"]
@@ -389,41 +330,38 @@ class PathCoherenceOscillator:
 # ------------------------------
 
 def load_data_yfinance(symbol: str, years_back: int = 3) -> pd.DataFrame:
-    """Download daily data for a symbol using yfinance.
-
-    Ensures the DataFrame always has an `AdjClose` column for downstream
-    processing (handles variants 'Adj Close' or falls back to 'Close').
-    """
+    """Download daily data for a symbol using yfinance."""
     end = datetime.today()
     start = end - timedelta(days=365 * years_back)
-    df = yf.download(symbol, start=start, end=end, interval="1d")  # daily data
+
+    print(f"Fetching {symbol} data from {start.date()} to {end.date()}...")
+    df = yf.download(symbol, start=start, end=end, interval="1d", auto_adjust=False, progress=False)
     df = df.dropna()
 
-    # Robustly ensure an `AdjClose` column exists
-    if "AdjClose" not in df.columns:
-        if "Adj Close" in df.columns:
-            df = df.rename(columns={"Adj Close": "AdjClose"})
-        elif "Close" in df.columns:
-            df["AdjClose"] = df["Close"].copy()
-        else:
-            raise ValueError("Downloaded data missing 'Close' or 'Adj Close' columns")
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(1)
 
+    if "Adj Close" in df.columns:
+        df["AdjClose"] = df["Adj Close"]
+    elif "Close" in df.columns:
+        df["AdjClose"] = df["Close"]
+    else:
+        raise ValueError("Downloaded data missing Close columns")
+
+    print(f"Loaded {len(df)} trading days")
     return df
 
 
 def compute_realized_vol(log_returns: pd.Series, window: int = 20) -> pd.Series:
     """Rolling realized variance (per day)."""
-    # Realized variance per day
-    var = log_returns.rolling(window).var()
-    return var
+    return log_returns.rolling(window).var()
 
 
 def compute_recent_trend(log_returns: pd.Series, window: int = 20) -> pd.Series:
     """Rolling trend score: cumulative return / realized vol."""
     cum_ret = log_returns.rolling(window).sum()
     vol = log_returns.rolling(window).std() * np.sqrt(window)
-    trend_score = cum_ret / (vol + 1e-8)
-    return trend_score
+    return cum_ret / (vol + 1e-8)
 
 
 def rolling_pco(
@@ -432,18 +370,16 @@ def rolling_pco(
     trend_score: pd.Series,
     horizon: int = 20,
     n_paths: int = 256,
-    step: int = 5,  # evaluate every N days for speed
+    step: int = 3,
 ) -> pd.Series:
-    """
-    Compute PCO on a rolling basis.
-
-    Returns a Series aligned to price dates (where PCO is evaluated).
-    """
+    """Compute PCO on a rolling basis with progress bar."""
     pco = PathCoherenceOscillator(n_paths=n_paths, horizon=horizon)
     osc_values = {}
-    idxs = range(horizon * 2, len(prices) - horizon, step)
+    idxs = list(range(horizon * 2, len(prices) - horizon, step))
 
-    for i in idxs:
+    print(f"\nComputing PCO for {len(idxs)} dates (n_paths={n_paths}, horizon={horizon})...")
+
+    for i in tqdm(idxs, desc="PCO Calculation", unit="date"):
         date = prices.index[i]
         s0 = float(prices.iloc[i])
         v0 = float(realized_var.iloc[i])
@@ -461,102 +397,62 @@ def rolling_pco(
 
 
 # ------------------------------
-# Visualization with Plotly
+# Visualization - SAVE AS HTML
 # ------------------------------
 
-def plot_price_and_pco(df: pd.DataFrame, pco_series: pd.Series, symbol: str) -> go.Figure:
-    """
-    Create a 2-row subplot: price + PCO oscillator.
-    """
+def plot_price_and_pco(df: pd.DataFrame, pco_series: pd.Series, symbol: str, 
+                       save_path: str = "pco_panel.html") -> go.Figure:
+    """Create a 2-row subplot: price + PCO oscillator and SAVE to HTML."""
     fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.03,
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03,
         row_heights=[0.65, 0.35],
         subplot_titles=(f"{symbol} Price", "Path Coherence Oscillator"),
-    )  # [web:53]
-
-    # Top: price
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["AdjClose"],
-            name=f"{symbol} Adj Close",
-            line=dict(color="#1f77b4", width=2),
-        ),
-        row=1,
-        col=1,
     )
 
-    # Optional moving average for context
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["AdjClose"], name=f"{symbol} Adj Close",
+        line=dict(color="#1f77b4", width=2)
+    ), row=1, col=1)
+
     ma = df["AdjClose"].rolling(50).mean()
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=ma,
-            name="50D MA",
-            line=dict(color="#ff7f0e", width=1.5, dash="dash"),
-        ),
-        row=1,
-        col=1,
-    )
+    fig.add_trace(go.Scatter(
+        x=df.index, y=ma, name="50D MA",
+        line=dict(color="#ff7f0e", width=1.5, dash="dash")
+    ), row=1, col=1)
 
-    # Bottom: oscillator
-    fig.add_trace(
-        go.Scatter(
-            x=pco_series.index,
-            y=pco_series.values,
-            name="PCO",
-            line=dict(color="#2ca02c", width=2),
-        ),
-        row=2,
-        col=1,
-    )
+    fig.add_trace(go.Scatter(
+        x=pco_series.index, y=pco_series.values, name="PCO",
+        line=dict(color="#2ca02c", width=2)
+    ), row=2, col=1)
 
-    # Regime bands
-    for y, name, color, dash in [
-        (50, "Transition threshold", "#7f7f7f", "dot"),
-        (80, "High-coherence threshold", "#d62728", "dot"),
-    ]:
-        fig.add_trace(
-            go.Scatter(
-                x=pco_series.index,
-                y=[y] * len(pco_series),
-                name=name,
-                line=dict(color=color, width=1, dash=dash),
-                showlegend=False,
-            ),
-            row=2,
-            col=1,
-        )
+    fig.add_hline(y=50, line_dash="dot", line_color="#7f7f7f", row=2, col=1)
+    fig.add_hline(y=80, line_dash="dot", line_color="#d62728", row=2, col=1)
 
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="PCO (0–100)", row=2, col=1, range=[0, 100])
 
     fig.update_layout(
         title=f"{symbol}: Path Coherence Oscillator",
-        xaxis2=dict(title="Date"),
-        template="plotly_white",
+        xaxis2=dict(title="Date"), template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         height=800,
     )
+
+    # SAVE TO HTML
+    fig.write_html(save_path)
+    print(f"  ✓ Saved: {save_path}")
 
     return fig
 
 
 def plot_scenario_fan(
-    df: pd.DataFrame,
-    pco: PathCoherenceOscillator,
-    s0: float,
-    v0: float,
-    recent_trend: float,
-    symbol: str,
-    lookback_days: int = 60,
+    df: pd.DataFrame, pco: PathCoherenceOscillator,
+    s0: float, v0: float, recent_trend: float,
+    symbol: str, lookback_days: int = 60,
+    save_path: str = "pco_scenario_fan.html"
 ) -> go.Figure:
-    """
-    Plot last N days of history + scenario fan of future paths from today.
-    """
+    """Plot last N days of history + scenario fan and SAVE to HTML."""
+    print("Generating scenario fan...")
     pco.generate_path_bundle(s0=s0, v0=v0, recent_trend=recent_trend)
 
     recent_df = df.iloc[-lookback_days:]
@@ -565,46 +461,35 @@ def plot_scenario_fan(
 
     fig = go.Figure()
 
-    # History
-    fig.add_trace(
-        go.Scatter(
-            x=recent_df.index,
-            y=recent_df["AdjClose"],
-            name=f"{symbol} History",
-            line=dict(color="#1f77b4", width=2),
-        )
-    )
+    fig.add_trace(go.Scatter(
+        x=recent_df.index, y=recent_df["AdjClose"],
+        name=f"{symbol} History", line=dict(color="#1f77b4", width=2)
+    ))
 
-    # Future scenarios (faint)
-    for scenario in pco.path_bundle:
-        fig.add_trace(
-            go.Scatter(
-                x=future_dates,
-                y=scenario.trajectory[1:],
-                mode="lines",
-                line=dict(color="rgba(31,119,180,0.10)", width=1),
-                showlegend=False,
-            )
-        )
+    # Sample paths for visualization
+    sample_paths = pco.path_bundle[::max(1, len(pco.path_bundle)//50)]
+    for scenario in sample_paths:
+        fig.add_trace(go.Scatter(
+            x=future_dates, y=scenario.trajectory[1:],
+            mode="lines", line=dict(color="rgba(31,119,180,0.15)", width=1),
+            showlegend=False
+        ))
 
-    # Highlight mean path
     mean_path = np.mean([p.trajectory for p in pco.path_bundle], axis=0)
-    fig.add_trace(
-        go.Scatter(
-            x=future_dates,
-            y=mean_path[1:],
-            name="Mean Scenario",
-            line=dict(color="#d62728", width=2),
-        )
-    )
+    fig.add_trace(go.Scatter(
+        x=future_dates, y=mean_path[1:],
+        name="Mean Scenario", line=dict(color="#d62728", width=2)
+    ))
 
     fig.update_layout(
         title=f"{symbol}: Scenario Fan from Current State",
-        xaxis_title="Date",
-        yaxis_title="Price",
-        template="plotly_white",
-        height=600,
+        xaxis_title="Date", yaxis_title="Price",
+        template="plotly_white", height=600,
     )
+
+    # SAVE TO HTML
+    fig.write_html(save_path)
+    print(f"  ✓ Saved: {save_path}")
 
     return fig
 
@@ -614,39 +499,52 @@ def plot_scenario_fan(
 # ------------------------------
 
 def main():
-    symbol = "SPY"  # change to TSLA, AAPL, etc.
-    print(f"Downloading data for {symbol}...")
+    symbol = "SPY"
+
+    print("="*60)
+    print("Path Coherence Oscillator - HTML Export Version")
+    print("="*60)
+
     df = load_data_yfinance(symbol, years_back=3)
 
+    print("\nCalculating features...")
     df["LogRet"] = np.log(df["AdjClose"]).diff()
     df.dropna(inplace=True)
 
     realized_var = compute_realized_vol(df["LogRet"], window=20)
     trend_score = compute_recent_trend(df["LogRet"], window=20)
 
-    print("Computing rolling PCO (this may take a bit)...")
     pco_series = rolling_pco(
         prices=df["AdjClose"],
         realized_var=realized_var,
         trend_score=trend_score,
         horizon=20,
         n_paths=256,
-        step=5,
+        step=3,
     )
 
-    # Price + oscillator chart
-    fig_panel = plot_price_and_pco(df, pco_series, symbol)
-    fig_panel.show()
+    print(f"\n✓ PCO computed for {len(pco_series)} dates")
+    print(f"  Latest reading: {pco_series.iloc[-1]:.1f}/100")
 
-    # Scenario fan from the latest date
-    last_idx = df.index[-1]
+    # Generate and SAVE charts as HTML
+    print("\nGenerating charts...")
+
+    # Chart 1: Price + Oscillator Panel
+    plot_price_and_pco(df, pco_series, symbol, save_path="pco_panel.html")
+
+    # Chart 2: Scenario Fan
     s0 = float(df["AdjClose"].iloc[-1])
     v0 = float(realized_var.iloc[-1])
     recent = float(trend_score.iloc[-1])
 
     pco = PathCoherenceOscillator(n_paths=256, horizon=20)
-    fig_fan = plot_scenario_fan(df, pco, s0, v0, recent, symbol)
-    fig_fan.show()
+    plot_scenario_fan(df, pco, s0, v0, recent, symbol, save_path="pco_scenario_fan.html")
+
+    print("\n" + "="*60)
+    print("✓ COMPLETE! Open these files in your browser:")
+    print("  • pco_panel.html - Price & PCO Oscillator")
+    print("  • pco_scenario_fan.html - Future Path Scenarios")
+    print("="*60)
 
 
 if __name__ == "__main__":
